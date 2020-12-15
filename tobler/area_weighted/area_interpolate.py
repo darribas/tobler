@@ -9,9 +9,43 @@ from ._vectorized_raster_interpolation import _fast_append_profile_in_gdf
 import warnings
 from scipy.sparse import dok_matrix, diags
 import pandas as pd
+from numba import njit
+from numba.typed import List as TList
 
 from tobler.util.util import _check_crs, _nan_check, _inf_check, _check_presence_of_crs
 
+def area_tables_binning_numba(source_df, target_df):
+    if _check_crs(source_df, target_df):
+        pass
+    else:
+        return None
+
+    df1 = source_df.copy()
+    df2 = target_df.copy()
+
+    l1, b1, r1, t1 = df1.total_bounds
+    l2, b2, r2, t2 = df2.total_bounds
+    total_bounds = [min(l1, l2), min(b1, b2), max(r1, r2), max(t1, t2)]
+    n1, k1 = df1.shape
+    n2, k2 = df2.shape
+    numPoly = n1 + n2
+    DELTA = 0.000001
+
+    # constants for bucket sizes
+    BUCK_SM = 8
+    BUCK_LG = 80
+    SHP_SMALL = 1000
+
+    shapebox = total_bounds
+    # bucket size
+    if numPoly < SHP_SMALL:
+        bucketmin = numPoly // BUCK_SM + 2
+    else:
+        bucketmin = numPoly // BUCK_LG + 2
+        # print 'bucketmin: ', bucketmin
+    # bucket length
+    lengthx = ((shapebox[2] + DELTA) - shapebox[0]) / bucketmin
+    lengthy = ((shapebox[3] + DELTA) - shapebox[1]) / bucketmin
 
 def _area_tables_binning(source_df, target_df):
     """Construct area allocation and source-target correspondence tables using a spatial indexing approach
