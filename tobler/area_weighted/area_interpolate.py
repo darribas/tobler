@@ -7,11 +7,11 @@ import numpy as np
 import geopandas as gpd
 from ._vectorized_raster_interpolation import _fast_append_profile_in_gdf
 import warnings
-from scipy.sparse import dok_matrix, diags
+from scipy.sparse import dok_matrix, diags, coo_matrix
 import pandas as pd
 from numba import njit
 from numba.typed import List as TList, Dict as TDict
-from time import time
+import pygeos
 
 from tobler.util.util import _check_crs, _nan_check, _inf_check, _check_presence_of_crs
 
@@ -43,20 +43,24 @@ def _build_bucket(n, bbs, minbox, binwidth):
     return columns, rows, poly2Column, poly2Row
 
 @njit
-def _get_neighbors(polyId, poly2Row1, poly2Column1, rows2, columns2):
-    idRows = poly2Row1[polyId]
-    idCols = poly2Column1[polyId]   
-    rowNeighbors = set([1 for i in range(0)])
-    colNeighbors = set([1 for i in range(0)])
-    for row in idRows:
-        rowNeighbors = rowNeighbors.union(rows2[row])
-    for col in idCols:
-        colNeighbors = colNeighbors.union(columns2[col])
-    neighbors = rowNeighbors.intersection(colNeighbors)
-    return neighbors
+def _list_to_intersect(poly2Row1, poly2Column1, rows2, columns2):
+    pairs = []
+    for polyId in range(len(poly2Row1)):
+        idRows = poly2Row1[polyId]
+        idCols = poly2Column1[polyId]   
+        rowNeighbors = set([1 for i in range(0)])
+        colNeighbors = set([1 for i in range(0)])
+        for row in idRows:
+            rowNeighbors = rowNeighbors.union(rows2[row])
+        for col in idCols:
+            colNeighbors = colNeighbors.union(columns2[col])
+        neighbors = rowNeighbors.intersection(colNeighbors)
+        for neighbor in neighbors:
+            pairs.append((polyId, neighbor))
+    pairs = np.array(pairs)
+    return pairs
 
 def area_tables_binning_numba(source_df, target_df):
-    t0= time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -93,7 +97,6 @@ def area_tables_binning_numba(source_df, target_df):
     [minbox_t.append(i) for i in minbox]
     binwidth_t = TList()
     [binwidth_t.append(i) for i in binwidth]
-    t1= time()
     
     # Fill buckets
     columns1, rows1, poly2Column1, poly2Row1 = _build_bucket(
@@ -102,35 +105,32 @@ def area_tables_binning_numba(source_df, target_df):
         minbox_t, 
         binwidth_t
     )
-    t2= time()
     columns2, rows2, poly2Column2, poly2Row2 = _build_bucket(
         n2, 
         df2.bounds.values, 
         minbox_t, 
         binwidth_t
     )
-    t3= time()
+    pairs_to_intersect = _list_to_intersect(poly2Row1, poly2Column1, rows2, columns1)
+    do_intersect = pygeos.intersects(
+        df1.geometry.values.data[pairs_to_intersect[:, 0]],
+        df2.geometry.values.data[pairs_to_intersect[:, 1]]
+    )
+    intersections = pygeos.intersection(
+        df1.geometry.values.data[pairs_to_intersect[do_intersect, 0]],
+        df2.geometry.values.data[pairs_to_intersect[do_intersect, 1]]
+    )
+    areas = pygeos.measurement.area(intersections)
+    table = coo_matrix(
+        areas, 
+        pairs_to_intersect[do_intersect, :] 
+    )
+    table = table.todok()
+    """
     table = dok_matrix((n1, n2), dtype=np.float32)
-    for polyId in range(n1):
-        
-        neighbors = _get_neighbors(
-            polyId, 
-            poly2Row1, 
-            poly2Column1, 
-            rows2, 
-            columns2
-        )
-
-        for neighbor in neighbors:
-            if df1.geometry.iloc[polyId].intersects(df2.geometry.iloc[neighbor]):
-                intersection = df1.geometry.iloc[polyId].intersection(
-                    df2.geometry.iloc[neighbor]
-                )
-                table[polyId, neighbor] = intersection.area
-
-    t4= time()
-    print(f"Step 1: {t1-t0} secs.\nStep 2a: {t2-t1} secs.\n"\
-          f"Step 2b: {t3-t2} secs\nStep 3: {t4-t3}")
+    for r, (i,j) in enumerate(pairs_to_intersect[do_intersect, :]):
+        table[i, j] = areas[r]
+    """
     return table
 
 def _area_tables_binning(source_df, target_df):
@@ -148,7 +148,6 @@ def _area_tables_binning(source_df, target_df):
     tables : scipy.sparse.dok_matrix
 
     """
-    t0 = time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -195,7 +194,6 @@ def _area_tables_binning(source_df, target_df):
     poly2Column2 = [set() for i in range(n2)]
     poly2Row2 = [set() for i in range(n2)]
 
-    t1 = time()
     for i in range(n1):
         shpObj = df1.geometry.iloc[i]
         bbcache[i] = shpObj.bounds
@@ -209,7 +207,6 @@ def _area_tables_binning(source_df, target_df):
             rows1[j].add(i)
             poly2Row1[i].add(j)
 
-    t2 = time()
     for i in range(n2):
         shpObj = df2.geometry.iloc[i]
         bbcache[i] = shpObj.bounds
@@ -223,7 +220,6 @@ def _area_tables_binning(source_df, target_df):
             rows2[j].add(i)
             poly2Row2[i].add(j)
 
-    t3 = time()
     table = dok_matrix((n1, n2), dtype=np.float32)
     for polyId in range(n1):
         idRows = poly2Row1[polyId]
@@ -241,9 +237,6 @@ def _area_tables_binning(source_df, target_df):
                     df2.geometry.iloc[neighbor]
                 )
                 table[polyId, neighbor] = intersection.area
-    t4 = time()
-    print(f"Step 1: {t1-t0} secs.\nStep 2a: {t2-t1} secs.\n"\
-          f"Step 2b: {t3-t2} secs\nStep 3: {t4-t3}")
     return table
 
 
