@@ -10,11 +10,53 @@ import warnings
 from scipy.sparse import dok_matrix, diags
 import pandas as pd
 from numba import njit
-from numba.typed import List as TList
+from numba.typed import List as TList, Dict as TDict
+from time import time
 
 from tobler.util.util import _check_crs, _nan_check, _inf_check, _check_presence_of_crs
 
+@njit
+def _gen_empty_sets(n):
+    empty_set = set([1 for i in range(0)])
+    l = TList()
+    for i in range(n):
+        l.append(empty_set)
+    return l
+
+@njit
+def _build_bucket(n, bbs, minbox, binwidth):
+    columns = _gen_empty_sets(n)
+    rows = _gen_empty_sets(n)
+    poly2Column = _gen_empty_sets(n)
+    poly2Row = _gen_empty_sets(n)
+    
+    for i in range(n):
+        projBBox = [int((bbs[i, j] - minbox[j]) / binwidth[j]) for j in range(4)]
+        for j in range(projBBox[0], projBBox[2] + 1):
+            columns[j].add(i)
+            poly2Column[i].add(j)        
+            
+        for j in range(projBBox[1], projBBox[3] + 1):
+            rows[j].add(i)
+            poly2Row[i].add(j)
+
+    return columns, rows, poly2Column, poly2Row
+
+@njit
+def _get_neighbors(polyId, poly2Row1, poly2Column1, rows2, columns2):
+    idRows = poly2Row1[polyId]
+    idCols = poly2Column1[polyId]   
+    rowNeighbors = set([1 for i in range(0)])
+    colNeighbors = set([1 for i in range(0)])
+    for row in idRows:
+        rowNeighbors = rowNeighbors.union(rows2[row])
+    for col in idCols:
+        colNeighbors = colNeighbors.union(columns2[col])
+    neighbors = rowNeighbors.intersection(colNeighbors)
+    return neighbors
+
 def area_tables_binning_numba(source_df, target_df):
+    t0= time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -42,10 +84,54 @@ def area_tables_binning_numba(source_df, target_df):
         bucketmin = numPoly // BUCK_SM + 2
     else:
         bucketmin = numPoly // BUCK_LG + 2
-        # print 'bucketmin: ', bucketmin
     # bucket length
     lengthx = ((shapebox[2] + DELTA) - shapebox[0]) / bucketmin
     lengthy = ((shapebox[3] + DELTA) - shapebox[1]) / bucketmin
+    binwidth = [lengthx, lengthy] * 2  # lenx,leny,lenx,leny
+    minbox = shapebox[:2] * 2  # minx,miny,minx,miny
+    minbox_t = TList()
+    [minbox_t.append(i) for i in minbox]
+    binwidth_t = TList()
+    [binwidth_t.append(i) for i in binwidth]
+    t1= time()
+    
+    # Fill buckets
+    columns1, rows1, poly2Column1, poly2Row1 = _build_bucket(
+        n1, 
+        df1.bounds.values, 
+        minbox_t, 
+        binwidth_t
+    )
+    t2= time()
+    columns2, rows2, poly2Column2, poly2Row2 = _build_bucket(
+        n2, 
+        df2.bounds.values, 
+        minbox_t, 
+        binwidth_t
+    )
+    t3= time()
+    table = dok_matrix((n1, n2), dtype=np.float32)
+    for polyId in range(n1):
+        
+        neighbors = _get_neighbors(
+            polyId, 
+            poly2Row1, 
+            poly2Column1, 
+            rows2, 
+            columns2
+        )
+
+        for neighbor in neighbors:
+            if df1.geometry.iloc[polyId].intersects(df2.geometry.iloc[neighbor]):
+                intersection = df1.geometry.iloc[polyId].intersection(
+                    df2.geometry.iloc[neighbor]
+                )
+                table[polyId, neighbor] = intersection.area
+
+    t4= time()
+    print(f"Step 1: {t1-t0} secs.\nStep 2a: {t2-t1} secs.\n"\
+          f"Step 2b: {t3-t2} secs\nStep 3: {t4-t3}")
+    return table
 
 def _area_tables_binning(source_df, target_df):
     """Construct area allocation and source-target correspondence tables using a spatial indexing approach
@@ -62,6 +148,7 @@ def _area_tables_binning(source_df, target_df):
     tables : scipy.sparse.dok_matrix
 
     """
+    t0 = time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -108,6 +195,7 @@ def _area_tables_binning(source_df, target_df):
     poly2Column2 = [set() for i in range(n2)]
     poly2Row2 = [set() for i in range(n2)]
 
+    t1 = time()
     for i in range(n1):
         shpObj = df1.geometry.iloc[i]
         bbcache[i] = shpObj.bounds
@@ -121,6 +209,7 @@ def _area_tables_binning(source_df, target_df):
             rows1[j].add(i)
             poly2Row1[i].add(j)
 
+    t2 = time()
     for i in range(n2):
         shpObj = df2.geometry.iloc[i]
         bbcache[i] = shpObj.bounds
@@ -134,6 +223,7 @@ def _area_tables_binning(source_df, target_df):
             rows2[j].add(i)
             poly2Row2[i].add(j)
 
+    t3 = time()
     table = dok_matrix((n1, n2), dtype=np.float32)
     for polyId in range(n1):
         idRows = poly2Row1[polyId]
@@ -151,7 +241,9 @@ def _area_tables_binning(source_df, target_df):
                     df2.geometry.iloc[neighbor]
                 )
                 table[polyId, neighbor] = intersection.area
-
+    t4 = time()
+    print(f"Step 1: {t1-t0} secs.\nStep 2a: {t2-t1} secs.\n"\
+          f"Step 2b: {t3-t2} secs\nStep 3: {t4-t3}")
     return table
 
 
