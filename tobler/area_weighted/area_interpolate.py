@@ -15,6 +15,7 @@ import pygeos
 
 from tobler.util.util import _check_crs, _nan_check, _inf_check, _check_presence_of_crs
 
+
 @njit
 def _gen_empty_sets(n):
     empty_set = set([1 for i in range(0)])
@@ -23,31 +24,33 @@ def _gen_empty_sets(n):
         l.append(empty_set)
     return l
 
+
 @njit
 def _build_bucket(n, bbs, minbox, binwidth):
     columns = _gen_empty_sets(n)
     rows = _gen_empty_sets(n)
     poly2Column = _gen_empty_sets(n)
     poly2Row = _gen_empty_sets(n)
-    
+
     for i in range(n):
         projBBox = [int((bbs[i, j] - minbox[j]) / binwidth[j]) for j in range(4)]
         for j in range(projBBox[0], projBBox[2] + 1):
             columns[j].add(i)
-            poly2Column[i].add(j)        
-            
+            poly2Column[i].add(j)
+
         for j in range(projBBox[1], projBBox[3] + 1):
             rows[j].add(i)
             poly2Row[i].add(j)
 
     return columns, rows, poly2Column, poly2Row
 
+
 @njit
 def _list_to_intersect(poly2Row1, poly2Column1, rows2, columns2):
     pairs = []
     for polyId in range(len(poly2Row1)):
         idRows = poly2Row1[polyId]
-        idCols = poly2Column1[polyId]   
+        idCols = poly2Column1[polyId]
         rowNeighbors = set([1 for i in range(0)])
         colNeighbors = set([1 for i in range(0)])
         for row in idRows:
@@ -59,6 +62,7 @@ def _list_to_intersect(poly2Row1, poly2Column1, rows2, columns2):
             pairs.append((polyId, neighbor))
     pairs = np.array(pairs)
     return pairs
+
 
 def area_tables_binning_numba(source_df, target_df):
     if _check_crs(source_df, target_df):
@@ -97,41 +101,34 @@ def area_tables_binning_numba(source_df, target_df):
     [minbox_t.append(i) for i in minbox]
     binwidth_t = TList()
     [binwidth_t.append(i) for i in binwidth]
-    
+
     # Fill buckets
     columns1, rows1, poly2Column1, poly2Row1 = _build_bucket(
-        n1, 
-        df1.bounds.values, 
-        minbox_t, 
-        binwidth_t
+        n1, df1.bounds.values, minbox_t, binwidth_t
     )
     columns2, rows2, poly2Column2, poly2Row2 = _build_bucket(
-        n2, 
-        df2.bounds.values, 
-        minbox_t, 
-        binwidth_t
+        n2, df2.bounds.values, minbox_t, binwidth_t
     )
     pairs_to_intersect = _list_to_intersect(poly2Row1, poly2Column1, rows2, columns1)
     do_intersect = pygeos.intersects(
         df1.geometry.values.data[pairs_to_intersect[:, 0]],
-        df2.geometry.values.data[pairs_to_intersect[:, 1]]
+        df2.geometry.values.data[pairs_to_intersect[:, 1]],
     )
     intersections = pygeos.intersection(
         df1.geometry.values.data[pairs_to_intersect[do_intersect, 0]],
-        df2.geometry.values.data[pairs_to_intersect[do_intersect, 1]]
+        df2.geometry.values.data[pairs_to_intersect[do_intersect, 1]],
     )
     areas = pygeos.measurement.area(intersections)
     table = coo_matrix(
-        areas, 
-        pairs_to_intersect[do_intersect, :] 
+        (
+            areas,
+            (pairs_to_intersect[do_intersect, 0], pairs_to_intersect[do_intersect, 1]),
+        ),
+        shape=(n1, n2),
     )
     table = table.todok()
-    """
-    table = dok_matrix((n1, n2), dtype=np.float32)
-    for r, (i,j) in enumerate(pairs_to_intersect[do_intersect, :]):
-        table[i, j] = areas[r]
-    """
     return table
+
 
 def _area_tables_binning(source_df, target_df):
     """Construct area allocation and source-target correspondence tables using a spatial indexing approach
