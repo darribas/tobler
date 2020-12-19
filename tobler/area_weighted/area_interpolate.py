@@ -12,6 +12,7 @@ import pandas as pd
 from numba import njit
 from numba.typed import List as TList, Dict as TDict
 import pygeos, os
+import time
 
 from tobler.util.util import _check_crs, _nan_check, _inf_check, _check_presence_of_crs
 
@@ -24,30 +25,27 @@ def _gen_empty_sets(n):
         l.append(empty_set)
     return l
 
-
 @njit
-def _build_bucket_src(n, bbs, minbox, binwidth):
-    poly2Column = _gen_empty_sets(n)
-    poly2Row = _gen_empty_sets(n)
-    
-    for i in range(n):
-        projBBox = [int((bbs[i, j] - minbox[j]) / binwidth[j]) for j in range(4)]
+def _find_pairs_to_intersect(
+    n1, n2, bounds1, bounds2, minbox, binwidth
+):
+    # Collect src polys to buckets
+    poly2Column = _gen_empty_sets(n1)
+    poly2Row = _gen_empty_sets(n1)
+    for i in range(n1):
+        projBBox = [int((bounds1[i, j] - minbox[j]) / binwidth[j]) for j in range(4)]
         
         for j in range(projBBox[0], projBBox[2] + 1):
             poly2Column[i].add(j)
             
         for j in range(projBBox[1], projBBox[3] + 1):
             poly2Row[i].add(j)
-            
-    return poly2Column, poly2Row
-
-@njit
-def _build_bucket_tgt(n, bbs, minbox, binwidth):
-    columns = _gen_empty_sets(n)
-    rows = _gen_empty_sets(n)
-
-    for i in range(n):
-        projBBox = [int((bbs[i, j] - minbox[j]) / binwidth[j]) for j in range(4)]
+ 
+    # Map buckets to targets
+    columns = _gen_empty_sets(n2)
+    rows = _gen_empty_sets(n2)
+    for i in range(n2):
+        projBBox = [int((bounds2[i, j] - minbox[j]) / binwidth[j]) for j in range(4)]
         
         for j in range(projBBox[0], projBBox[2] + 1):
             columns[j].add(i)
@@ -55,20 +53,16 @@ def _build_bucket_tgt(n, bbs, minbox, binwidth):
         for j in range(projBBox[1], projBBox[3] + 1):
             rows[j].add(i)
 
-    return columns, rows
-
-@njit
-def _list_to_intersect(poly2Row1, poly2Column1, rows2, columns2):
     pairs = []
-    for polyId in range(len(poly2Row1)):
-        idRows = poly2Row1[polyId]
-        idCols = poly2Column1[polyId]
+    for polyId in range(len(poly2Row)):
+        idRows = poly2Row[polyId]
+        idCols = poly2Column[polyId]
         rowNeighbors = set([1 for i in range(0)])
         colNeighbors = set([1 for i in range(0)])
         for row in idRows:
-            rowNeighbors = rowNeighbors.union(rows2[row])
+            rowNeighbors = rowNeighbors.union(rows[row])
         for col in idCols:
-            colNeighbors = colNeighbors.union(columns2[col])
+            colNeighbors = colNeighbors.union(columns[col])
         neighbors = rowNeighbors.intersection(colNeighbors)
         for neighbor in neighbors:
             pairs.append((polyId, neighbor))
@@ -89,6 +83,7 @@ def _intersect_area_on_chunk(polys1, polys2):
     return areas
 
 def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
+    t0 = time.time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -128,16 +123,13 @@ def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
     binwidth_t = TList()
     [binwidth_t.append(i) for i in binwidth]
 
-    # Fill buckets
-    poly2Column1, poly2Row1 = _build_bucket_src(
-        n1, df1.bounds.values, minbox_t, binwidth_t
+    t1 = time.time()
+    # Find pairs to intersect
+    pairs_to_intersect = _find_pairs_to_intersect(
+        n1, n2, df1.bounds.values, df2.bounds.values, minbox_t, binwidth_t       
     )
-    columns2, rows2 = _build_bucket_tgt(
-        n2, df2.bounds.values, minbox_t, binwidth_t
-    )
-    
-    # pygeos cookie-cutter
-    pairs_to_intersect = _list_to_intersect(poly2Row1, poly2Column1, rows2, columns2)
+    t2 = time.time()
+    # Perform cookie-cutter intersections
     if n_jobs == 1:
         # Single core
         do_intersect = pygeos.intersects(
@@ -173,6 +165,7 @@ def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
                 for chunk_pair in chunks_to_intersection
             )
         areas = np.concatenate(worker_out)
+    t3 = time.time()
     # Store in sparse matrix
     table = coo_matrix(
         (
@@ -183,6 +176,8 @@ def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
         dtype=np.float32
     )
     table = table.todok()
+    t4 = time.time()
+    print(f"Setup: {t1-t0} secs\nBuckets+: {t2-t1} secs\nIntersections: {t3-t2} secs\nConversion: {t4-t3} secs")
     return table
 
 
@@ -201,6 +196,7 @@ def _area_tables_binning(source_df, target_df):
     tables : scipy.sparse.dok_matrix
 
     """
+    t0 = time.time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -232,6 +228,7 @@ def _area_tables_binning(source_df, target_df):
     # bucket length
     lengthx = ((shapebox[2] + DELTA) - shapebox[0]) / bucketmin
     lengthy = ((shapebox[3] + DELTA) - shapebox[1]) / bucketmin
+    t1 = time.time()
 
     # initialize buckets
     columns1 = [set() for i in range(bucketmin)]
@@ -273,6 +270,7 @@ def _area_tables_binning(source_df, target_df):
             rows2[j].add(i)
             poly2Row2[i].add(j)
 
+    t2 = time.time()
     table = dok_matrix((n1, n2), dtype=np.float32)
     for polyId in range(n1):
         idRows = poly2Row1[polyId]
@@ -290,6 +288,8 @@ def _area_tables_binning(source_df, target_df):
                     df2.geometry.iloc[neighbor]
                 )
                 table[polyId, neighbor] = intersection.area
+    t3 = time.time()
+    print(f"Setup: {t1-t0} secs\nBuckets: {t2-t1} secs\nIntersections: {t3-t2} secs")
     return table
 
 
