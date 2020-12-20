@@ -182,7 +182,6 @@ def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
 
 
 def area_tables_binning_rtree(source_df, target_df, n_jobs=-1):
-    t0 = time.time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -193,29 +192,21 @@ def area_tables_binning_rtree(source_df, target_df, n_jobs=-1):
     df1 = source_df.copy()
     df2 = target_df.copy()
 
-    t1 = time.time()
     # Find pairs to intersect
-    inp, res = df1.sindex.query_bulk(df2.geometry, predicate='intersects')
-    t2 = time.time()
+    ids_tgt, ids_src = df1.sindex.query_bulk(df2.geometry, predicate='intersects')
     # Perform cookie-cutter intersections
     if n_jobs == 1:
         # Single core
-        areas = df1.geometry.values[res].intersection(df2.geometry.values[inp]).area
+        areas = df1.geometry.values[ids_src].intersection(
+                df2.geometry.values[ids_tgt]
+                    ).area
     else:
-        # DOES NOT WORK AT THE MOMENT
         # Multi core
         from joblib import Parallel, delayed, parallel_backend
-        # Intersects?
-        chunks_to_intersects = _chunk_polys(pairs_to_intersect, df1, df2, n_jobs)
-        with parallel_backend("loky", inner_max_num_threads=1):
-            worker_out = Parallel(n_jobs=n_jobs)(
-                delayed(pygeos.intersects)(*chunk_pair)
-                for chunk_pair in chunks_to_intersects
-            )
-        do_intersect = np.concatenate(worker_out)
         # Intersections + areas
+        pairs_to_intersect = np.vstack([ids_src, ids_tgt]).T
         chunks_to_intersection = _chunk_polys(
-            pairs_to_intersect[do_intersect],
+            pairs_to_intersect,
             df1,
             df2,
             n_jobs
@@ -226,19 +217,16 @@ def area_tables_binning_rtree(source_df, target_df, n_jobs=-1):
                 for chunk_pair in chunks_to_intersection
             )
         areas = np.concatenate(worker_out)
-    t3 = time.time()
     # Store in sparse matrix
     table = coo_matrix(
         (
             areas,
-            (res, inp),
+            (ids_src, ids_tgt),
         ),
         shape=(df1.shape[0], df2.shape[0]),
         dtype=np.float32
     )
     table = table.todok()
-    t4 = time.time()
-    print(f"Setup: {t1-t0} secs\nBuckets+: {t2-t1} secs\nIntersections: {t3-t2} secs\nConversion: {t4-t3} secs")
     return table
 
 
