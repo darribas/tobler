@@ -76,6 +76,16 @@ def _chunk_polys(ids, df1, df2, n_jobs):
         chunk1 = df1.geometry.values.data[ids[start:start+chunk_size, 0]]
         chunk2 = df2.geometry.values.data[ids[start:start+chunk_size, 1]]
         yield chunk1, chunk2
+
+def _chunk_df(df_polys, tgt_polys, n_jobs):
+    chunk_size = np.int64(df_polys.shape[0] / n_jobs) + 1
+    for i in range(n_jobs):
+        start = i * chunk_size
+        yield df_polys.iloc[start:start+chunk_size], tgt_polys
+
+def _sindex_qb(df1_polys, df2_polys):
+    si = pygeos.STRtree(df1_polys.values.data)
+    return si.query_bulk(df2_polys.values.data, predicate="intersects")
         
 def _intersect_area_on_chunk(polys1, polys2):
     intersection = pygeos.intersection(polys1, polys2)
@@ -193,8 +203,25 @@ def area_tables_binning_rtree(source_df, target_df, n_jobs=-1):
     df2 = target_df.copy()
 
     # Find pairs to intersect
-    ids_tgt, ids_src = df1.sindex.query_bulk(df2.geometry, predicate='intersects')
-    # Perform cookie-cutter intersections
+    if n_jobs == 1:
+        # Single core
+        ids_tgt, ids_src = df1.sindex.query_bulk(
+                df2.geometry, 
+                predicate="intersects"
+                )
+    else:
+        # Multi-core
+        from joblib import Parallel, delayed, parallel_backend
+        src_chunks = _chunk_df(df1.geometry, df2.geometry, n_jobs)
+        with parallel_backend("loky", inner_max_num_threads=1):
+            worker_out = Parallel(n_jobs=n_jobs)(
+                delayed(_sindex_qb)(
+                    *chunk
+                )
+                for chunk in src_chunks
+            )
+        ids_tgt, ids_src = np.hstack(worker_out)
+    # Perform cookie-cutter intersections + areas
     if n_jobs == 1:
         # Single core
         areas = df1.geometry.values[ids_src].intersection(
@@ -202,8 +229,6 @@ def area_tables_binning_rtree(source_df, target_df, n_jobs=-1):
                     ).area
     else:
         # Multi core
-        from joblib import Parallel, delayed, parallel_backend
-        # Intersections + areas
         pairs_to_intersect = np.vstack([ids_src, ids_tgt]).T
         chunks_to_intersection = _chunk_polys(
             pairs_to_intersect,
@@ -245,7 +270,6 @@ def _area_tables_binning(source_df, target_df):
     tables : scipy.sparse.dok_matrix
 
     """
-    t0 = time.time()
     if _check_crs(source_df, target_df):
         pass
     else:
@@ -277,7 +301,6 @@ def _area_tables_binning(source_df, target_df):
     # bucket length
     lengthx = ((shapebox[2] + DELTA) - shapebox[0]) / bucketmin
     lengthy = ((shapebox[3] + DELTA) - shapebox[1]) / bucketmin
-    t1 = time.time()
 
     # initialize buckets
     columns1 = [set() for i in range(bucketmin)]
@@ -319,7 +342,6 @@ def _area_tables_binning(source_df, target_df):
             rows2[j].add(i)
             poly2Row2[i].add(j)
 
-    t2 = time.time()
     table = dok_matrix((n1, n2), dtype=np.float32)
     for polyId in range(n1):
         idRows = poly2Row1[polyId]
@@ -337,8 +359,6 @@ def _area_tables_binning(source_df, target_df):
                     df2.geometry.iloc[neighbor]
                 )
                 table[polyId, neighbor] = intersection.area
-    t3 = time.time()
-    print(f"Setup: {t1-t0} secs\nBuckets: {t2-t1} secs\nIntersections: {t3-t2} secs")
     return table
 
 
