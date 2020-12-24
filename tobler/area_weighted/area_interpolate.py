@@ -26,7 +26,7 @@ def _gen_empty_sets(n):
     return l
 
 @njit
-def _find_pairs_to_intersect(
+def _build_buckets(
     n1, n2, bounds1, bounds2, minbox, binwidth
 ):
     # Collect src polys to buckets
@@ -45,14 +45,22 @@ def _find_pairs_to_intersect(
     columns = _gen_empty_sets(n2)
     rows = _gen_empty_sets(n2)
     for i in range(n2):
-        projBBox = [int((bounds2[i, j] - minbox[j]) / binwidth[j]) for j in range(4)]
+        projBBox = [
+                int((bounds2[i, j] - minbox[j]) / binwidth[j]) \
+                        for j in range(4)
+                ]
         
         for j in range(projBBox[0], projBBox[2] + 1):
             columns[j].add(i)
 
         for j in range(projBBox[1], projBBox[3] + 1):
             rows[j].add(i)
+    return columns, rows, poly2Column, poly2Row
 
+@njit
+def _find_pairs_to_intersect(
+    columns, rows, poly2Column, poly2Row
+):
     pairs = []
     for polyId in range(len(poly2Row)):
         idRows = poly2Row[polyId]
@@ -82,7 +90,7 @@ def _intersect_area_on_chunk(polys1, polys2):
     areas = pygeos.measurement.area(intersection)
     return areas
 
-def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
+def area_tables_binning_numba(source_df, target_df, n_jobs=-1, verbose=False):
     t0 = time.time()
     if _check_crs(source_df, target_df):
         pass
@@ -123,10 +131,28 @@ def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
     binwidth_t = TList()
     [binwidth_t.append(i) for i in binwidth]
 
-    t1 = time.time()
+    t1a = time.time()
     # Find pairs to intersect
+    columns, rows, poly2Column, poly2Row = _build_buckets(
+            n1,
+            n2,
+            df1.bounds.values,
+            df2.bounds.values,
+            minbox_t, 
+            binwidth_t
+    )
+    t1b = time.time()
+    if verbose:
+        print(f"Columns: {len(columns)}\nRows: {len(rows)}")
+        cards = np.array([len(poly2Column[i]) for i in poly2Column])
+        print(f"poly2Column: {len(poly2Column)} | "\
+              f"Av: {cards.mean()} | Std: {cards.std()}")
+        cards = np.array([len(poly2Row[i]) for i in poly2Row])
+        print(f"poly2Row: {len(poly2Row)} | "\
+              f"Av: {cards.mean()} | Std: {cards.std()}")
+    t1c = time.time()
     pairs_to_intersect = _find_pairs_to_intersect(
-        n1, n2, df1.bounds.values, df2.bounds.values, minbox_t, binwidth_t       
+        columns, rows, poly2Column, poly2Row       
     )
     t2 = time.time()
     # Perform cookie-cutter intersections
@@ -177,7 +203,10 @@ def area_tables_binning_numba(source_df, target_df, n_jobs=-1):
     )
     table = table.todok()
     t4 = time.time()
-    print(f"Setup: {t1-t0} secs\nBuckets+: {t2-t1} secs\nIntersections: {t3-t2} secs\nConversion: {t4-t3} secs")
+    if verbose:
+        print(f"Setup: {t1a-t0} secs\nBuckets: {t1b-t1a} secs\n"\
+              f"Find pairs: {t2-t1c} secs\n"\
+              f"Intersections: {t3-t2} secs\nConversion: {t4-t3} secs")
     return table
 
 
